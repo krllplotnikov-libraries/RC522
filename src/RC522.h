@@ -44,12 +44,12 @@ typedef enum RC522_CardEvent RC522_CardEvent_et;
 typedef struct RC522_Descriptor RC522_Descriptor_st;
 typedef struct RC522            RC522_st;
 
-typedef void (*SPI_Transmit)             (RC522_st* rc522, uint8_t* txBuf, size_t size);
-typedef void (*SPI_Receive)              (RC522_st* rc522, uint8_t* rxBuf, size_t size);
-typedef void (*SPI_ChipSelect)           (RC522_st* rc522, uint8_t level);
-typedef void (*Reset)                    (RC522_st* rc522, uint8_t level);
-typedef void (*CardEvent_Callback)       (RC522_st* rc522, RC522_CardEvent_et event);
-typedef uint32_t (*GetTick)              ();
+typedef void (*RC522_SPI_Transmit)             (RC522_st* rc522, uint8_t* txBuf, size_t size);
+typedef void (*RC522_SPI_Receive)              (RC522_st* rc522, uint8_t* rxBuf, size_t size);
+typedef void (*RC522_SPI_ChipSelect)           (RC522_st* rc522, uint8_t level);
+typedef void (*RC522_Reset)                    (RC522_st* rc522, uint8_t level);
+typedef void (*RC522_CardEvent_Callback)       (RC522_st* rc522, RC522_CardEvent_et event);
+typedef uint32_t (*RC522_GetTick)              ();
 
 enum RC522_Status{
 	RC522_STATUS_OK,
@@ -68,12 +68,12 @@ enum RC522_CardEvent{
 };
 
 struct RC522_Descriptor{
-	SPI_Transmit         spiTransmit;
-	SPI_Receive          spiReceive;
-	SPI_ChipSelect       spiChipSelect;
-	Reset                reset;
-	GetTick              getTick;
-	CardEvent_Callback   eventCallback;
+	RC522_SPI_Transmit         spiTransmit;
+	RC522_SPI_Receive          spiReceive;
+	RC522_SPI_ChipSelect       spiChipSelect;
+	RC522_Reset                reset;
+	RC522_GetTick              getTick;
+	RC522_CardEvent_Callback   eventCallback;
 };
 
 struct RC522{
