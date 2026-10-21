@@ -8,7 +8,9 @@ static void RC522_ClearBitMask(RC522_st* rc522, uint8_t reg, uint8_t mask);
 static void RC522_AntennaOn(RC522_st* rc522);
 static void RC522_AntennaOff(RC522_st* rc522);
 static RC522_Status_et RC522_RequestA(RC522_st* rc522);
-RC522_Status_et RC522_Anticoll(RC522_st* rc522, uint8_t *uid);
+static RC522_Status_et RC522_Transceive(RC522_st* rc522, const uint8_t* tx, uint8_t txLen,
+                                        uint8_t* rx, uint8_t* rxLen);
+static void RC522_CalcCrcA(const uint8_t* data, uint8_t len, uint8_t* crc);
 static void RC522_Delay(RC522_st* rc522, uint32_t ms);
 
 
@@ -74,17 +76,49 @@ RC522_CardState_et RC522_GetCardState(RC522_st* rc522){
 	return rc522->cardState;
 }
 
-RC522_Status_et RC522_ReadUid(RC522_st* rc522, uint8_t *uid){
-    // Card detected, read UID
-    uint8_t rawUid[5];
-    if (RC522_Anticoll(rc522, rawUid) != RC522_STATUS_OK) {
-        return RC522_STATUS_ERROR;
+RC522_Status_et RC522_ReadUid(RC522_st* rc522, uint8_t *uid, uint8_t *uidSize){
+    static const uint8_t selCmd[3] = { PICC_SEL_CL1, PICC_SEL_CL2, PICC_SEL_CL3 };
+    uint8_t size = 0;
+
+    for (uint8_t level = 0; level < 3; level++) {
+        uint8_t frame[9];
+        uint8_t rxLen;
+        RC522_Status_et st;
+
+        frame[0] = selCmd[level];
+        frame[1] = PICC_NVB_ANTICOLL;
+        rxLen = 5;
+        st = RC522_Transceive(rc522, frame, 2, &frame[2], &rxLen);
+        if (st != RC522_STATUS_OK) return st;
+        if (rxLen != 5) return RC522_STATUS_ERROR;
+        if ((frame[2] ^ frame[3] ^ frame[4] ^ frame[5]) != frame[6]) return RC522_STATUS_ERROR;  // BCC
+
+        frame[1] = PICC_NVB_SELECT;
+        RC522_CalcCrcA(frame, 7, &frame[7]);
+        uint8_t sakResp[3];
+        rxLen = 3;
+        st = RC522_Transceive(rc522, frame, 9, sakResp, &rxLen);
+        if (st != RC522_STATUS_OK) return st;
+        if (rxLen != 3) return RC522_STATUS_ERROR;
+        uint8_t crc[2];
+        RC522_CalcCrcA(sakResp, 1, crc);
+        if (crc[0] != sakResp[1] || crc[1] != sakResp[2]) return RC522_STATUS_ERROR;
+
+        if (sakResp[0] & PICC_SAK_UID_NOT_COMPLETE) {
+            if (frame[2] != PICC_CASCADE_TAG) return RC522_STATUS_ERROR;
+            memcpy(&rc522->uid[size], &frame[3], 3);
+            size += 3;
+        } else {
+            memcpy(&rc522->uid[size], &frame[2], 4);
+            size += 4;
+            rc522->uidSize = size;
+            rc522->sak = sakResp[0];
+            if (uid)     memcpy(uid, rc522->uid, size);
+            if (uidSize) *uidSize = size;
+            return RC522_STATUS_OK;
+        }
     }
-    // Copy UID (drop BCC)
-    for (int i = 0; i < 4; i++) {
-        uid[i] = rawUid[i];
-    }
-    return RC522_STATUS_OK;
+    return RC522_STATUS_ERROR;
 }
 
 RC522_Status_et RC522_WaitcardRemove(RC522_st* rc522){
@@ -193,55 +227,64 @@ static RC522_Status_et RC522_RequestA(RC522_st* rc522){
     return RC522_STATUS_TIMEOUT;
 }
 
-RC522_Status_et RC522_Anticoll(RC522_st* rc522, uint8_t *uid){  // Returns 4-byte UID + BCC
-    RC522_WriteReg(rc522, PCD_COM_IRQ_REG, 0x7F);      // Clear IRQs
-    RC522_WriteReg(rc522, PCD_FIFO_LEVEL_REG, 0x80);   // Flush FIFO
-    RC522_WriteReg(rc522, PCD_BIT_FRAMING_REG, 0x00);  // Full frame
-    RC522_WriteReg(rc522, PCD_FIFO_DATA_REG, PICC_SEL_CL1);  // 0x93
-    RC522_WriteReg(rc522, PCD_FIFO_DATA_REG, 0x20);    // Fixed CRC
-    RC522_Delay(rc522, 2);  // Delay for stability
-    RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_TRANSCEIVE);
-    RC522_SetBitMask(rc522, PCD_BIT_FRAMING_REG, 0x80);
-
-    uint32_t timeout = rc522->descriptor.getTick() + 25;
-    while (rc522->descriptor.getTick() < timeout) {
-        uint8_t status2 = RC522_ReadReg(rc522, PCD_STATUS2_REG);
-        if (status2 & 0x01) {  // Command complete
-            uint8_t err = RC522_ReadReg(rc522, PCD_ERROR_REG);
-            if (err & 0x1D) {
-                RC522_AntennaOff(rc522);
-                RC522_Delay(rc522, 5);
-                RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
-                return RC522_STATUS_ERROR;
-            }
-            uint8_t fifoLvl = RC522_ReadReg(rc522, PCD_FIFO_LEVEL_REG);
-            if (fifoLvl == 5) {  // 4-byte UID + BCC
-                for (int i = 0; i < 5; i++) {
-                    uid[i] = RC522_ReadReg(rc522, PCD_FIFO_DATA_REG);
-                }
-                // Validate BCC
-                uint8_t calcBcc = uid[0] ^ uid[1] ^ uid[2] ^ uid[3];
-                if (uid[4] != calcBcc) {
-                    RC522_AntennaOff(rc522);
-                    RC522_Delay(rc522, 5);
-                    RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
-                    return RC522_STATUS_ERROR;
-                }
-                RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
-                RC522_Delay(rc522, 2);  // Post-command delay
-                return RC522_STATUS_OK;
-            }
-            RC522_AntennaOff(rc522);
-            RC522_Delay(rc522, 5);
-            RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
-            return RC522_STATUS_ERROR;
-        }
-        RC522_Delay(rc522, 1);  // Mimic debug log timing
-    }
-    RC522_AntennaOff(rc522);
-    RC522_Delay(rc522, 5);
+static RC522_Status_et RC522_Transceive(RC522_st* rc522, const uint8_t* tx, uint8_t txLen,
+                                        uint8_t* rx, uint8_t* rxLen){
     RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
-    return RC522_STATUS_TIMEOUT;
+    RC522_WriteReg(rc522, PCD_COM_IRQ_REG, 0x7F);       // Clear IRQs
+    RC522_WriteReg(rc522, PCD_FIFO_LEVEL_REG, 0x80);    // Flush FIFO
+    for (uint8_t i = 0; i < txLen; i++) {
+        RC522_WriteReg(rc522, PCD_FIFO_DATA_REG, tx[i]);
+    }
+    RC522_WriteReg(rc522, PCD_BIT_FRAMING_REG, 0x00);   // Full bytes
+    RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_TRANSCEIVE);
+    RC522_SetBitMask(rc522, PCD_BIT_FRAMING_REG, 0x80); // StartSend
+
+    RC522_Status_et result = RC522_STATUS_TIMEOUT;
+    uint32_t start = rc522->descriptor.getTick();
+    while ((uint32_t)(rc522->descriptor.getTick() - start) < 25) {
+        uint8_t irq = RC522_ReadReg(rc522, PCD_COM_IRQ_REG);
+        if (irq & 0x30) {
+            result = RC522_STATUS_OK;
+            break;
+        }
+        if (irq & 0x01) {
+            break;
+        }
+    }
+    RC522_ClearBitMask(rc522, PCD_BIT_FRAMING_REG, 0x80);
+
+    if (result != RC522_STATUS_OK) {
+        RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
+        return result;
+    }
+
+    if (RC522_ReadReg(rc522, PCD_ERROR_REG) & 0x1B) {
+        RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
+        return RC522_STATUS_ERROR;
+    }
+
+    uint8_t n = RC522_ReadReg(rc522, PCD_FIFO_LEVEL_REG) & 0x7F;
+    if (n > *rxLen) {
+        RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
+        return RC522_STATUS_ERROR;
+    }
+    for (uint8_t i = 0; i < n; i++) {
+        rx[i] = RC522_ReadReg(rc522, PCD_FIFO_DATA_REG);
+    }
+    *rxLen = n;
+    RC522_WriteReg(rc522, PCD_COMMAND_REG, PCD_IDLE);
+    return RC522_STATUS_OK;
+}
+
+static void RC522_CalcCrcA(const uint8_t* data, uint8_t len, uint8_t* crc){
+    uint16_t c = 0x6363;
+    for (uint8_t i = 0; i < len; i++) {
+        uint8_t b = data[i] ^ (uint8_t)(c & 0xFF);
+        b ^= (uint8_t)(b << 4);
+        c = (c >> 8) ^ ((uint16_t)b << 8) ^ ((uint16_t)b << 3) ^ (b >> 4);
+    }
+    crc[0] = (uint8_t)(c & 0xFF);
+    crc[1] = (uint8_t)(c >> 8);
 }
 
 static void RC522_Delay(RC522_st* rc522, uint32_t ms){
